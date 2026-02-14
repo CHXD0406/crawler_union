@@ -1,6 +1,7 @@
 # crawler_union
 目前应该实现所有爬虫代码的保存/商品初始化逻辑：
 1.对于商品初始化列表，建议使用：
+
 def get_tasks_from_file(name_file, max_count, data_dir):
     """
     读取任务列表，并扫描数据目录，检查是否有已爬取的进度。
