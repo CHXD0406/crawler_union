@@ -1,149 +1,69 @@
-"""
-eBay 商品爬虫
-搜索 URL 格式: https://www.ebay.com/sch/i.html?_nkw=keyword&_sacat=0&_from=R40&_pgn=page
-无需登录即可爬取搜索结果
-"""
 import asyncio
 import json
 import os
 import re
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from bs4 import BeautifulSoup
 
-# 搜索页基础 URL（参考: skirt 第7页 https://www.ebay.com/sch/i.html?_nkw=skirt&_sacat=0&_from=R40&_pgn=7）
+# 适配导入路径：尝试从同级或父级导入 crawler_base
+try:
+    from crawler_base import BaseCrawler, MultiCrawlerManager
+except ImportError:
+    import sys
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from crawler.crawler_base import BaseCrawler, MultiCrawlerManager
+
+# eBay 基础配置
 EBAY_SEARCH_BASE = "https://www.ebay.com/sch/i.html"
 
-
-def build_search_url(keyword, page=1):
-    """构建 eBay 搜索 URL"""
-    params = {
-        "_nkw": keyword,
-        "_sacat": 0,
-        "_from": "R40",
-        "_pgn": page,
-    }
-    return f"{EBAY_SEARCH_BASE}?{urlencode(params)}"
-
-
-class EbayCrawler:
-    """eBay 爬虫类"""
-
-    def __init__(self, headless=True, save_html=False, browser_channel=None):
+class EbayCrawler(BaseCrawler):
+    def extract_products(self, html_content, keyword, page_num):
         """
-        headless: 是否无头模式（云服务器必须 True）
-        save_html: 是否保存 HTML
-        browser_channel: 浏览器通道。None 使用 Chromium（适合 Linux 云服务器），"msedge" 使用 Edge（本地 Windows）
-        """
-        self.headless = headless
-        self.save_html = save_html
-        self.browser_channel = browser_channel
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
-
-    async def init_browser(self):
-        """初始化浏览器（channel=None 时用 Chromium，适合云服务器；channel='msedge' 时用 Edge）"""
-        if not self.playwright:
-            self.playwright = await async_playwright().start()
-        launch_opts = {
-            "headless": self.headless,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-            ],
-        }
-        if self.browser_channel:
-            launch_opts["channel"] = self.browser_channel
-        self.browser = await self.playwright.chromium.launch(**launch_opts)
-        self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-        )
-        self.page = await self.context.new_page()
-        await self.page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
-
-    async def close(self):
-        """关闭浏览器"""
-        if self.page:
-            try:
-                await self.page.close()
-            except:
-                pass
-        if self.context:
-            try:
-                await self.context.close()
-            except:
-                pass
-        if self.browser:
-            try:
-                await self.browser.close()
-            except:
-                pass
-        if getattr(self, "playwright", None):
-            try:
-                await self.playwright.stop()
-            except:
-                pass
-
-    async def scroll_to_load(self, scroll_times=3):
-        """滚动页面以加载动态内容"""
-        for _ in range(scroll_times):
-            await self.page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await asyncio.sleep(0.5)
-        await self.page.evaluate("window.scrollTo(0, 0)")
-        await asyncio.sleep(0.3)
-
-    def extract_products(self, html_content, page_num, category):
-        """
-        从 eBay 搜索结果 HTML 中提取商品
-        eBay 常见结构: ul.srp-results li.s-item, .s-item__title, .s-item__price, .s-item__link, .s-item__image
-        输出: title, price, image, link, Category, Platform
+        eBay 专属 HTML 解析逻辑
+        ✅ 关键点：将 page_num 写入每条数据，用于精准断点续传
         """
         soup = BeautifulSoup(html_content, "html.parser")
         products = []
-        # 商品列表项: li.s-item
+        
+        # 容器选择器策略
         containers = soup.select("li.s-item")
         if not containers:
             containers = soup.find_all("li", class_=re.compile(r"s-item", re.I))
+        # 兜底策略
         if not containers:
-            # 备用: 包含 s-item__title 的父元素
             for elem in soup.select(".s-item__title"):
                 parent = elem.find_parent("li")
                 if parent and parent not in containers:
                     containers.append(parent)
 
-        for idx, container in enumerate(containers, 1):
+        print(f"🔍 [Port {self.port}] 解析页面 (Page {page_num})，找到容器: {len(containers)} 个")
+
+        for container in containers:
             try:
-                # 跳过“Shop on eBay”等广告占位
+                # 1. 提取链接
                 link_elem = container.select_one("a.s-item__link")
                 if not link_elem:
                     link_elem = container.find("a", href=re.compile(r"ebay\.com/itm/"))
                 href = (link_elem.get("href", "") or "").strip() if link_elem else ""
-                if not href or "itm/" not in href:
-                    continue
+                
+                # 过滤无效链接
+                if not href or "itm/" not in href: continue
 
-                if href.startswith("//"):
-                    href = "https:" + href
-                elif href.startswith("/"):
-                    href = "https://www.ebay.com" + href
+                # 格式化链接
+                if href.startswith("//"): href = "https:" + href
+                elif href.startswith("/"): href = "https://www.ebay.com" + href
                 href = href.replace("&amp;", "&")
 
+                # 2. 提取标题
                 title_elem = container.select_one(".s-item__title")
                 title = (title_elem.get_text(strip=True) or "").strip() if title_elem else ""
-                if title == "Shop on eBay":
-                    continue
+                
+                # 过滤广告
+                if title == "Shop on eBay": continue
 
+                # 3. 提取价格
                 price_elem = container.select_one(".s-item__price")
                 price = ""
                 if price_elem:
@@ -152,168 +72,279 @@ class EbayCrawler:
                     if price_match:
                         price = price_match.group().replace(",", "")
 
+                # 4. 提取图片
                 img_elem = container.select_one(".s-item__image img")
-                if not img_elem:
-                    img_elem = container.select_one(".s-item__img img")
-                if not img_elem:
-                    img_elem = container.find("img", src=True)
+                if not img_elem: img_elem = container.select_one(".s-item__img img")
                 image = ""
                 if img_elem:
-                    image = (
-                        img_elem.get("src")
-                        or img_elem.get("data-src")
-                        or img_elem.get("data-imgurl")
-                        or ""
-                    )
-                    if image and image.startswith("//"):
-                        image = "https:" + image
-                    elif image and image.startswith("/"):
-                        image = "https://www.ebay.com" + image
+                    image = (img_elem.get("src") or 
+                             img_elem.get("data-src") or 
+                             img_elem.get("data-imgurl") or "")
+                    if image.startswith("//"): image = "https:" + image
 
+                # 组装数据
                 record = {
                     "title": title,
                     "price": price,
                     "image": image,
                     "link": href,
-                    "Category": category,
-                    "Platform": "ebay",
+                    "keyword": keyword, 
+                    "platform": "ebay",
+                    "page": page_num  # ✅ 必须包含 page 字段
                 }
+                
                 if title or href:
                     products.append(record)
-            except Exception as e:
-                continue
 
+            except Exception:
+                continue
+                
         return products
 
+    async def crawl(self, tasks, max_count, output_dir):
+        """
+        eBay 爬取主循环
+        tasks 格式: [(keyword, start_page), ...]
+        start_page: 上次爬取的最大页码
+        """
+        # 简单排序任务
+        tasks.sort(key=lambda x: x[1])
 
-async def crawl_products_automated(
-    keywords,
-    num_pages_per_keyword,
-    headless=False,
-    save_html=False,
-    output_dir="ebay_data",
-    browser_channel=None,
-):
+        try:
+            # 1. 启动浏览器
+            await self.init_browser()
+            if not self.page: return
+
+            # 2. 遍历任务
+            for keyword, start_page in tasks:
+                # 这里的 max_count 指的是目标商品条数
+                print(f"\n{'='*40}\n[Port {self.port}] 爬取: {keyword} (上次断点: Page {start_page})\n{'='*40}")
+                
+                current_count = 0 
+                keyword_products = []
+                
+                # ✅ 关键逻辑：直接从断点页的下一页开始，不使用 item count 估算
+                page_num = start_page + 1
+                
+                # 循环条件：直到抓够数量或无数据
+                while current_count < max_count:
+                    # 构建 URL
+                    encoded_kw = urllib.parse.quote(keyword)
+                    url = f"{EBAY_SEARCH_BASE}?_nkw={encoded_kw}&_sacat=0&_from=R40&_pgn={page_num}"
+                    
+                    print(f"  🌍 [Port {self.port}] 访问第 {page_num} 页... (本轮已抓: {current_count})")
+                    
+                    try:
+                        await self.page.goto(url)
+                        try: await self.page.wait_for_load_state('domcontentloaded', timeout=15000)
+                        except: pass
+                        
+                        # 滚动触发懒加载
+                        await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+                        await asyncio.sleep(1)
+                        await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(2)
+
+                        # 提取数据
+                        html = await self.page.content()
+                        items = self.extract_products(html, keyword, page_num)
+                        
+                        if not items:
+                            print(f"  ⚠️ [Port {self.port}] 第 {page_num} 页无数据，结束当前关键词。")
+                            break
+                        
+                        keyword_products.extend(items)
+                        current_count += len(items)
+                        print(f"  ✓ [Port {self.port}] 提取 {len(items)} 条")
+                        
+                        # 翻页
+                        page_num += 1
+                        await asyncio.sleep(2) # 礼貌等待
+
+                    except Exception as e:
+                        print(f"  ❌ [Port {self.port}] 页面出错: {e}")
+                        break
+                    
+                    # 防止无限翻页的安全阈值 (可选)
+                    if page_num > 100: break
+
+                # 3. 保存数据
+                if keyword_products:
+                    # 传入 start_page 作为断点标识，_save_data 会处理合并
+                    self._save_data(keyword, keyword_products, start_page, output_dir)
+                else:
+                    print(f"⚠️ [Port {self.port}] {keyword} 未提取到新数据")
+
+        except Exception as e:
+            print(f"❌ [Port {self.port}] 进程错误: {e}")
+        finally:
+            await self.close()
+
+    def _save_data(self, product_name, new_data, start_index, output_dir):
+        """
+        通用保存逻辑 (符合 README 标准)
+        支持根据 page 字段自动判断翻页逻辑并合并数据
+        """
+        final_data = new_data
+        files_to_remove = []
+        
+        # 文件名清洗
+        safe_name = re.sub(r'[<>:"/\\|?*]', "_", product_name)[:50]
+        
+        if start_index > 0:
+            print(f"\n🔄 [Port {self.port}] 检测到续传 (Start: {start_index})，合并旧文件...")
+            try:
+                from pathlib import Path
+                data_path = Path(output_dir)
+                candidate_files = []
+                for f in data_path.glob(f'{safe_name}_products_*.json'):
+                    candidate_files.append(f)
+                candidate_files.sort(key=lambda x: x.name, reverse=True)
+
+                if candidate_files:
+                    latest_json = candidate_files[0]
+                    with open(latest_json, 'r', encoding='utf-8') as f:
+                        old_data = json.load(f)
+
+                    if isinstance(old_data, list) and len(old_data) > 0:
+                        # 核心检测：是翻页逻辑(eBay) 还是 滚动逻辑(Depop)
+                        is_page_logic = 'page' in old_data[0]
+
+                        if is_page_logic:
+                            # 翻页逻辑：直接追加数据
+                            print(f"    📄 [翻页模式] 上次进度 Page {start_index}，追加数据...")
+                        else:
+                            # 滚动逻辑：检查长度
+                            if len(old_data) != start_index:
+                                print(f"    ⚠️ 长度校验不一致: 旧({len(old_data)}) vs 标记({start_index})")
+                        
+                        final_data = old_data + new_data
+                        print(f"    ➕ 合并成功: 旧({len(old_data)}) + 新({len(new_data)}) = 总({len(final_data)})")
+                        
+                        files_to_remove.append(latest_json)
+                        old_csv = latest_json.with_suffix('.csv')
+                        if old_csv.exists(): files_to_remove.append(old_csv)
+            except Exception as e:
+                print(f"    ❌ 合并失败: {e}")
+
+        # 持久化
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        if not os.path.exists(output_dir): os.makedirs(output_dir)
+        
+        json_path = os.path.join(output_dir, f"{safe_name}_products_{timestamp}.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(final_data, f, ensure_ascii=False, indent=2)
+        print(f"  💾 [Port {self.port}] JSON: {os.path.basename(json_path)}")
+        
+        # CSV 保存
+        import csv
+        if final_data:
+            csv_path = os.path.join(output_dir, f"{safe_name}_products_{timestamp}.csv")
+            try:
+                with open(csv_path, 'w', encoding='utf-8', newline='') as f:
+                    keys = final_data[0].keys()
+                    writer = csv.DictWriter(f, fieldnames=keys)
+                    writer.writeheader()
+                    writer.writerows(final_data)
+            except: pass
+
+        # 清理
+        if files_to_remove:
+            for f in files_to_remove:
+                try: os.remove(f)
+                except: pass
+
+# ==================== 标准任务获取逻辑 ====================
+def get_tasks_from_file(name_file, max_count, data_dir):
     """
-    按关键词列表爬取 eBay 搜索结果
-    keywords: 关键词列表，如 ['skirt', 'dress']
-    num_pages_per_keyword: 每个关键词爬取的页数
-    browser_channel: None=Chromium（云服务器），"msedge"=Edge（本地）
+    符合 README 标准的任务初始化函数
+    自动识别 page 断点或 index 断点
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    crawler = EbayCrawler(
-        headless=headless, save_html=save_html, browser_channel=browser_channel
-    )
-    all_products = []
+    import json
+    from pathlib import Path
 
     try:
-        await crawler.init_browser()
-        for kw_idx, keyword in enumerate(keywords, 1):
-            print(f"\n{'='*60}")
-            print(f"关键词 {kw_idx}/{len(keywords)}: {keyword}")
-            print(f"{'='*60}")
-            keyword_products = []
-            for page in range(1, num_pages_per_keyword + 1):
-                url = build_search_url(keyword, page)
-                print(f"  第 {page}/{num_pages_per_keyword} 页: {url}")
-                try:
-                    await crawler.page.goto(
-                        url, wait_until="domcontentloaded", timeout=60000
-                    )
-                    await asyncio.sleep(2)
-                    await crawler.scroll_to_load(scroll_times=3)
-                    html_content = await crawler.page.content()
-                    if save_html:
-                        safe_name = re.sub(r'[<>:"/\\|?*]', "_", keyword)[:50]
-                        html_path = output_dir / f"{safe_name}_page_{page}.html"
-                        with open(html_path, "w", encoding="utf-8") as f:
-                            f.write(html_content)
-                    items = crawler.extract_products(html_content, page, keyword)
-                    keyword_products.extend(items)
-                    print(f"    提取 {len(items)} 条")
-                except Exception as e:
-                    print(f"    错误: {e}")
-                await asyncio.sleep(1)
-            # 按 link 去重
-            seen = set()
-            unique = []
-            for p in keyword_products:
-                link = (p.get("link") or "").strip()
-                if link and link in seen:
-                    continue
-                if link:
-                    seen.add(link)
-                unique.append(p)
-            if unique:
-                all_products.extend(unique)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_name = re.sub(r'[<>:"/\\|?*]', "_", keyword)[:50]
-                json_path = output_dir / f"{safe_name}_products_{ts}.json"
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(unique, f, ensure_ascii=False, indent=2)
-                print(f"  已保存: {json_path.name}, 共 {len(unique)} 条")
-    finally:
-        await crawler.close()
+        if not os.path.exists(name_file):
+            print(f"❌ 任务文件不存在: {name_file}")
+            return []
+        with open(name_file, 'r', encoding='utf-8') as f:
+            names = json.load(f)
+        product_names = list(set(names))
+    except Exception as e:
+        print(f"❌ 读取任务失败: {e}")
+        return []
 
-    if all_products:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        all_path = output_dir / f"all_products_{ts}.json"
-        with open(all_path, "w", encoding="utf-8") as f:
-            json.dump(all_products, f, ensure_ascii=False, indent=2)
-        print(f"\n全部保存: {all_path}, 共 {len(all_products)} 条")
-    return all_products
-
-
-def get_crawled_products(data_dir="ebay_data", check_html=True):
-    """从数据目录中提取已爬取的关键词（对应商品名）"""
+    tasks_progress = {name: 0 for name in product_names}
     data_path = Path(data_dir)
-    if not data_path.exists():
-        return set()
-    crawled = set()
-    for f in data_path.glob("*_products_*.json"):
-        if f.name.startswith("all_products"):
-            continue
-        m = re.match(r"^(.+?)_products_\d{8}_\d{6}\.json$", f.name)
-        if m:
-            crawled.add(m.group(1))
-    if check_html:
-        for f in data_path.glob("*_page_*.html"):
-            m = re.match(r"^(.+?)_page_\d+\.html$", f.name)
-            if m:
-                crawled.add(m.group(1))
-    return crawled
 
+    if data_path.exists():
+        print(f"🔍 扫描 {data_dir} 断点...")
+        for json_file in data_path.glob('*_products_*.json'):
+            if json_file.name.startswith('all_products'): continue
+            
+            # 文件名匹配
+            match = re.match(r'^(.+?)_products_\d{8}_\d{6}\.json$', json_file.name)
+            if not match: continue
+            
+            # 注意：文件名是 safe_name，需要简单匹配回原名 (此处简化处理)
+            # 实际项目中建议在文件名中保留更精确的 ID 或哈希，或者在这里做模糊匹配
+            p_safe_name = match.group(1)
+            
+            # 反向查找对应的原始 task name
+            target_task = None
+            for name in product_names:
+                if re.sub(r'[<>:"/\\|?*]', "_", name)[:50] == p_safe_name:
+                    target_task = name
+                    break
+            
+            if target_task and target_task in tasks_progress:
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if data and isinstance(data, list):
+                        last_item = data[-1]
+                        # 优先取 page，没有则取 index
+                        current = int(last_item.get('page', 0))
+                        if not current:
+                            current = int(last_item.get('index', len(data)))
+                        
+                        if current > tasks_progress[target_task]:
+                            tasks_progress[target_task] = current
+                except: pass
 
-def filter_products(products_list, crawled_products):
-    """从列表中移除已爬取的关键词"""
-    uncrawled = [p for p in products_list if p not in crawled_products]
-    crawled = [p for p in products_list if p in crawled_products]
-    return uncrawled, crawled
+    final_tasks = []
+    for name, progress in tasks_progress.items():
+        # eBay 的 max_count 是条数，progress 是页数。
+        # 这里只要 progress > 0 就打印恢复信息，具体是否爬完由 crawl 内部 current_count 判断
+        if progress > 0:
+            print(f"  🔄 恢复任务: {name} (从 Page {progress} 继续)")
+        final_tasks.append((name, progress))
 
+    return sorted(final_tasks, key=lambda x: x[0])
 
+# ==================== 主入口 ====================
 if __name__ == "__main__":
-    script_dir = Path(__file__).parent
-    data_dir = script_dir.parent / "ebay_data"
-    if not data_dir.exists():
-        data_dir = script_dir / "ebay_data"
-    data_dir = str(data_dir)
-    print("eBay 商品爬虫")
-    print("=" * 60)
-    print(f"数据目录: {data_dir}")
-    keywords_list = ['Salwar Suit Sets', 'Dupattas', 'Half Sarees', 'Lehenga Cholis', 'Salwar Suit Sets', 'Sarees', 'Safari Suits', 'Salwar Suit Sets', 'Sherwanis', 'Anarkali Suits', 'Cholis', 'Dupattas', 'Lehenga Cholis', 'Maternity Churidar Bottoms', 'Maternity Kurtas & Kurtis', 'Maternity Salwar Bottoms', 'Maternity Salwar Suit Sets', 'Salwar Suit Sets', 'Sarees', 'Ghillie Shirts', 'Headwear', 'Kilt Pins & Brooches', 'Sock Flashes', 'Sporrans', 'Lederhosen', 'Trachten Hats', 'Trachten Neckerchiefs', 'Trachten Jackets', 'Trachten Shirts', 'Trachten Waistcoats', 'Dirndl Aprons', 'Dirndl Bras', 'Dirndl Dresses', 'Lederhosen', 'Trachten Cardigans', 'Traditional German Blouses', 'Serapes & Ponchos', 'Huipiles', 'Keffiyeh & Shemagh', 'Kufi Caps', 'Shalwar Kemeez', 'Thobes & Dishdasha', 'Abayas', 'Burqas', 'Hijabs', 'Modest Swimwear', 'Niqabs', 'Ridas', 'Cords', 'Hoods', 'Stoles', 'Tassel Charms', 'Tassels', 'Cap & Gown Sets', 'Gowns', 'Scrub Dresses', 'Folding Fans', 'Paddle Fans', 'Handbag Hangers', 'Handbag Organizers', 'Keyrings, Keychains & Charms', 'Cold Weather Scarves & Wraps', 'Wraps & Pashminas', 'Bridal Veils', 'Fascinators', 'Checkbook Covers', 'Active Sweatsuits', 'Insulated Shells', 'Jackets by Sport', 'Casual Jackets', 'Denim Jackets', 'Faux Fur', 'Fur', 'Quilted Lightweight Jackets', 'Anoraks', 'Trench Coats', 'Pea Coats', 'Jumpsuits', 'Bra Extenders', 'Breast Lift Tape', 'Breast Petals', 'Lingerie Bags', 'Lingerie Tape', 'Pads & Enhancers', 'Straps', 'Adhesive Bras', 'Everyday Bras', 'Mastectomy Bras', 'Minimizers', 'Maternity Bras', 'Nursing Bras', 'Bustiers', 'Corsets', 'Camisoles & Tanks', 'Tangas', 'Control Panties', 'Full Slips', 'Half Slips', 'Thigh Slimmers', 'Full Slips', 'Half Slips', 'Pant Liner Slips', 'Onesies', 'Sheers', 'Blazers', 'Separates', 'Dress Suits', 'Pantsuits', 'Skirt Suits', 'Tunics', 'Clutches', 'Evening Bags', 'Crossbody Bags', 'Fashion Backpacks', 'Hobo Bags', 'Satchels', 'Wristlets', 'Body Chains', 'Italian Style', 'Snake', 'Bead', 'Clasp', 'Italian Style', 'Strand', 'Stretch', 'Wrap', 'Clip-Ons', 'Cuffs & Wraps', 'Earring Jackets', 'Jewelry Sets', 'Chokers', 'Pearl Strands', 'Pendant Necklaces', 'Strands', 'Torque', 'Y-Necklaces', 'Pendant Enhancers', 'Pendants Only', 'Bands', 'Semi-Mounted', 'Stacking', 'Statement', 'Anniversary Rings', 'Bridal Sets', 'Engagement Rings', 'Eternity Rings', 'Promise Rings', 'Ring Enhancers', 'Wedding Bands', 'Ankle & Bootie', 'Knee-High', 'Mid-Calf', 'Over-the-Knee', 'Flats', 'Flip-Flops', 'Gladiator Sandals', 'Heeled Sandals', 'Outdoor', 'Platforms', 'Wedges', 'Slides', 'Active Pants', 'Active Shirts & Tees', 'Coats, Jackets & Vests', 'Abdominal Support', 'Belly Bands', 'Maternity Bras', 'Nursing Bras', 'Sleepshirts', 'Henleys', 'Knits & Tees', 'Tunics', 'Sleepshirts', 'Henleys', 'Tunics', 'Scrub Dresses']
-    num_pages = 5
-    crawled = get_crawled_products(data_dir, check_html=True)
-    keywords_list, _ = filter_products(keywords_list, crawled)
-    if keywords_list:
-        asyncio.run(
-            crawl_products_automated(
-                keywords=keywords_list,
-                num_pages_per_keyword=num_pages,
-                headless=False,
-                save_html=True,
-                output_dir=data_dir,
-            )
+    print("eBay 爬虫 (标准版)")
+    print("="*60)
+
+    WORKER_COUNT = 2      # eBay 建议低并发
+    BASE_PORT = 9333      # 独立端口段
+    MAX_CRAWL = 100       # 目标抓取条数
+    OUTPUT_DIR = 'ebay_data'
+    TASK_FILE = 'clothing_leaf_names.json'
+
+    all_tasks = get_tasks_from_file(TASK_FILE, MAX_CRAWL, OUTPUT_DIR)
+    
+    if all_tasks:
+        print(f"📦 任务数: {len(all_tasks)}")
+        manager = MultiCrawlerManager(
+            crawler_class=EbayCrawler, 
+            base_port=BASE_PORT, 
+            workers=WORKER_COUNT
         )
+        try:
+            asyncio.run(manager.run(all_tasks, MAX_CRAWL, OUTPUT_DIR))
+        except KeyboardInterrupt:
+            print("🛑 停止")
     else:
-        print("当前没有待爬取的关键词")
+        print("🎉 无任务")
