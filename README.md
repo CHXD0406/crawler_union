@@ -1,12 +1,12 @@
 # crawler_union
 目前应该实现所有爬虫代码的保存/商品初始化逻辑：
-1.对于商品初始化列表，建议使用：
+ 
+ 1.对于商品初始化列表，建议使用：
 
-def get_tasks_from_file(name_file, max_count, data_dir):
-    """
-    读取任务列表，并扫描数据目录，检查是否有已爬取的进度。
-    返回格式: [(product_name, start_index), ...]
-    """
+
+    def get_tasks_from_file(name_file, max_count, data_dir):
+
+
     # 1. 读取原始任务列表
     try:
         if not os.path.exists(name_file):
@@ -77,11 +77,16 @@ def get_tasks_from_file(name_file, max_count, data_dir):
 
 
 2.对于商品保存，建议使用：
-def _save_data(self, product_name, new_data, start_index, output_dir):
+
+        def _save_data(self, product_name, new_data, start_index, output_dir):
+
         """通用保存数据辅助函数：支持索引合并与页码合并"""
+        
         final_data = new_data
         files_to_remove = []
+        
         # 1. 预处理文件名逻辑（eBay关键词可能包含特殊字符，需与任务获取逻辑一致）
+        
         safe_name = re.sub(r'[<>:"/\\|?*]', "_", product_name)[:50]
         if start_index > 0:
             print(f"\n🔄 [合并模式] 检测到续传 (起始标记 {start_index})，检索旧文件...")
@@ -89,7 +94,9 @@ def _save_data(self, product_name, new_data, start_index, output_dir):
                 from pathlib import Path
                 data_path = Path(output_dir)
                 candidate_files = []
+                
                 # 使用清洗后的文件名进行搜索
+                
                 for f in data_path.glob(f'{safe_name}_products_*.json'):
                     candidate_files.append(f)
                 
@@ -160,7 +167,7 @@ def _save_data(self, product_name, new_data, start_index, output_dir):
                     print(f"    🗑️ 删除: {f.name}")
                 except Exception as e:
                     print(f"    ⚠️ 无法删除旧文件 {f.name}: {e}")
-  统一使用这个函数来确保合并数据时的鲁棒性
+        统一使用这个函数来确保合并数据时的鲁棒性
 
 
 
