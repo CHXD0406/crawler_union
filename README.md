@@ -7,9 +7,6 @@ def get_tasks_from_file(name_file, max_count, data_dir):
     读取任务列表，并扫描数据目录，检查是否有已爬取的进度。
     返回格式: [(product_name, start_index), ...]
     """
-    import json
-    from pathlib import Path
-
     # 1. 读取原始任务列表
     try:
         if not os.path.exists(name_file):
@@ -84,10 +81,8 @@ def _save_data(self, product_name, new_data, start_index, output_dir):
         """通用保存数据辅助函数：支持索引合并与页码合并"""
         final_data = new_data
         files_to_remove = []
-
         # 1. 预处理文件名逻辑（eBay关键词可能包含特殊字符，需与任务获取逻辑一致）
         safe_name = re.sub(r'[<>:"/\\|?*]', "_", product_name)[:50]
-
         if start_index > 0:
             print(f"\n🔄 [合并模式] 检测到续传 (起始标记 {start_index})，检索旧文件...")
             try:
