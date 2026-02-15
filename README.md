@@ -1,3 +1,17 @@
+# DAY2.16
+更新一次，中台已经搭建完毕，组织架构为：
+CrawlerApp{crawler.exe,resources{backend，spiders，web},_internal}
+点击exe即可使用，如需修改，只用修改spiders中对应各网站的爬虫即可
+
+
+
+
+
+
+
+
+
+
 # crawler_union
 目前应该实现所有爬虫代码的保存/商品初始化逻辑：
  
