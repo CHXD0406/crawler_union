@@ -1,5 +1,6 @@
 # DAY2.16
 更新一次，中台已经搭建完毕，组织架构为：
+
 CrawlerApp{crawler.exe,resources{backend，spiders，web},_internal}
 点击exe即可使用，如需修改，只用修改spiders中对应各网站的爬虫即可
 
